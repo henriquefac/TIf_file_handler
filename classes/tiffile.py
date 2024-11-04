@@ -1,130 +1,102 @@
-from osgeo import gdal
-import rasterio
-from rasterio.windows import from_bounds
-from rasterio.transform import from_origin
+from osgeo import gdal, ogr
 
-# Classe responsável por lidar com arquivos do tipo tif
+# Classe responsável por lidar com arquivos do tipo TIFF
 class TifHandler:
-    def __init__(self, path) -> None:
-        # Caminho do arquivo referenciado
-        self.path: str = path
-        # Objeto raster do arquivo tif
-        self.raster_obj: gdal.Dataset = self.getTifFile()
-        # Recorte
+    def __init__(self, path):
+        # Caminho do arquivo TIFF
+        self.path = path
+        # Objeto raster do arquivo TIFF
+        self.raster_obj = self._load_tif_file()
+        # Recorte da banda (armazenado após o recorte)
         self.banda_recorte = None
 
-    # Pegar arquivo como objeto raster
-    def getTifFile(self) -> gdal.Dataset:
+    # Carrega o arquivo TIFF como um objeto raster
+    def _load_tif_file(self):
         return gdal.Open(self.path)
 
-    # Informações principais
-    def getInforTif(self) -> dict:
-        raster: gdal.Dataset = self.raster_obj
-        info = {
-            'RasterXSize': raster.RasterXSize,
-            'RasterYSize': raster.RasterYSize,
-            'BandsCount': raster.RasterCount,
-            "coordenadas reais": {
-                "OrigemX": raster.GetGeoTransform()[0],
-                "PixelWidth": raster.GetGeoTransform()[1],
-                "OrigemY": raster.GetGeoTransform()[3],
-                "PixelHeight": raster.GetGeoTransform()[5],
+    # Retorna informações principais do arquivo TIFF
+    def get_info(self):
+        geo_transform = self.raster_obj.GetGeoTransform()
+        return {
+            'Largura': self.raster_obj.RasterXSize,
+            'Altura': self.raster_obj.RasterYSize,
+            'Número de Bandas': self.raster_obj.RasterCount,
+            "Coordenadas Reais": {
+                "Origem X": geo_transform[0],
+                "Largura do Pixel": geo_transform[1],
+                "Origem Y": geo_transform[3],
+                "Altura do Pixel": geo_transform[5],
             },
-            "WKT": raster.GetProjection(),
-            "meta": raster.GetMetadata()
+            "Projeção": self.raster_obj.GetProjection(),
+            "Metadados": self.raster_obj.GetMetadata()
         }
-        return info
 
-    # Recorte do arquivo tif
-    def recorte(self, limite_norte, limite_sul, limite_oeste, limite_leste):
-        # Abrir o arquivo TIFF
-        with rasterio.open(self.path) as src:
-            # Definir a janela de recorte com base nas coordenadas
-            janela = from_bounds(limite_oeste, limite_sul, limite_leste, limite_norte, src.transform)
+    # Realiza o recorte do arquivo TIFF a partir de coordenadas geográficas
+    def recortar_por_limites(self, norte, sul, oeste, leste):
+        geo_transform = self.raster_obj.GetGeoTransform()
+        inv_geo_transform = gdal.InvGeoTransform(geo_transform)
 
-            # Verificar se a janela é válida
-            if janela.height <= 0 or janela.width <= 0:
-                raise ValueError("Coordenadas de recorte resultam em uma janela inválida.")
+        # Converte as coordenadas geográficas para coordenadas de pixel
+        x_min, y_max = gdal.ApplyGeoTransform(inv_geo_transform, oeste, norte)
+        x_max, y_min = gdal.ApplyGeoTransform(inv_geo_transform, leste, sul)
 
-            # Fazer a leitura do recorte
-            recorte = src.read(window=janela)
+        # Garante que os índices são inteiros
+        x_min, x_max = int(x_min), int(x_max)
+        y_min, y_max = int(y_min), int(y_max)
 
-            # Printar o shape da matriz recortada (bandas, altura, largura)
-            self.banda_recorte = recorte
-            return recorte
-
-    # Cria novo arquivo tif se houver recorte
-    def getNewTif(self, path):
-        if self.banda_recorte is None:
-            return
-        
-        # Obtenha a matriz e suas dimensões
-        matrix = self.banda_recorte
-        nrows, ncols = matrix.shape[1], matrix.shape[2]  # shape é (bands, height, width)
-        
-        # Obtém a transformação do arquivo original
-        with rasterio.open(self.path) as src:
-            transform = src.transform
-            # Cria um novo arquivo TIFF com as mesmas configurações
-            new_transform = from_origin(transform[0], transform[3], transform[1], transform[5])
-
-            with rasterio.open(
-                path,
-                'w',
-                driver='GTiff',
-                height=nrows,
-                width=ncols,
-                count=1,  # Número de bandas
-                dtype=matrix.dtype,
-                crs=src.crs,
-                transform=new_transform
-            ) as dst:
-                dst.write(matrix, 1)  # Escreve a matriz na primeira banda
-
-    def get_matrix(self):
+        # Recorta a primeira banda do TIFF com base nos limites
         banda = self.raster_obj.GetRasterBand(1)
-        matriz_alturas = banda.ReadAsArray()
-        return matriz_alturas
+        self.banda_recorte = banda.ReadAsArray(x_min, y_min, x_max - x_min, y_max - y_min)
+        return self.banda_recorte
 
-    # a partir de um arquivo shapefile, fazer o recorte do tif
-    
+    # Salva o recorte em um novo arquivo TIFF
+    def salvar_novo_tif(self, caminho_saida):
+        if self.banda_recorte is None:
+            raise ValueError("Não há recorte para salvar. Execute o método de recorte primeiro.")
 
+        # Cria um novo dataset TIFF com as dimensões do recorte
+        driver = gdal.GetDriverByName("GTiff")
+        out_raster = driver.Create(
+            caminho_saida,
+            self.banda_recorte.shape[1],  # largura
+            self.banda_recorte.shape[0],  # altura
+            1,                            # número de bandas
+            gdal.GDT_Float32              # tipo de dados (ajuste conforme necessário)
+        )
 
-    # Printar informações do raster do arquivo tif formatado
-    def __str__(self) -> str:
-        info = self.getInforTif()
+        # Define a transformação geoespacial para o novo arquivo
+        geo_transform = self.raster_obj.GetGeoTransform()
+        out_raster.SetGeoTransform(geo_transform)
+        out_raster.SetProjection(self.raster_obj.GetProjection())
 
-        def string_list(list_: list, space_heranca=""):
-            if len(list_) == 0:
-                return "[]"
-            string = "[\n"
-            space = "   " + space_heranca
-            for elemento in list_:
-                if isinstance(elemento, list):
-                    string += string_list(elemento, space)
-                elif isinstance(elemento, dict):
-                    string += string_dict(elemento, space)
-                else:
-                    string += f"{elemento}"
-                string += ",\n"
-            string += space_heranca + "]\n"
-            return string
+        # Grava o recorte na nova banda
+        out_band = out_raster.GetRasterBand(1)
+        out_band.WriteArray(self.banda_recorte)
 
-        def string_dict(dict_: dict, space_heranca=""):
-            if len(list(dict_.keys())) == 0:
-                return "{}"
-            string = "{\n"
-            space = "   " + space_heranca
-            for key, value in dict_.items():
-                string += space + f"{key} : "
-                if isinstance(value, list):
-                    string += string_list(value, space)
-                elif isinstance(value, dict):
-                    string += string_dict(value, space)
-                else:
-                    string += f"{value}"
-                string += ",\n"
-            string += space_heranca + "}"
-            return string
+        # Salva e fecha o novo arquivo
+        out_band.FlushCache()
+        out_raster = None
 
-        return string_dict(info)
+    # Recorta o arquivo TIFF com base em um shapefile (limite do Ceará)
+    def recortar_por_shapefile(self, path_shapefile):
+        # Abre o shapefile usando OGR
+        shapefile = ogr.Open(path_shapefile)
+        layer = shapefile.GetLayer()
+
+        # Cria uma máscara a partir das geometrias do shapefile
+        mask_ds = gdal.Warp(
+            '', self.raster_obj, format='MEM', cutlineDSName=path_shapefile,
+            cropToCutline=True
+        )
+
+        # Extrai a primeira banda da máscara
+        self.banda_recorte = mask_ds.GetRasterBand(1).ReadAsArray()
+        mask_ds = None
+        return self.banda_recorte
+
+    # Imprime informações do arquivo TIFF formatadas
+    def __str__(self):
+        info = self.get_info()
+        return "\n".join(f"{k}: {v}" if not isinstance(v, dict) else f"{k}:\n" + 
+                         "\n".join(f"  {sub_k}: {sub_v}" for sub_k, sub_v in v.items()) 
+                         for k, v in info.items())
